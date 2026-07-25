@@ -59,11 +59,17 @@ module.exports = class MarkdownDocxExporterPlugin extends Plugin {
     await fs.promises.mkdir(outputFolderPath, { recursive: true });
 
     const outputFileName = `${sanitizeBaseName(file.basename)}.docx`;
-    const outputPath = path.join(outputFolderPath, outputFileName);
+    const preferredOutputPath = path.join(outputFolderPath, outputFileName);
+    const outputPath = await resolveWritableOutputPath(preferredOutputPath);
+    const actualOutputFileName = path.basename(outputPath);
     const args = this.buildPandocArgs(sourcePath, outputPath, vaultBasePath, file);
 
     new Notice("Exporting Markdown to DOCX...");
-    await runProcess(this.settings.pandocPath || DEFAULT_SETTINGS.pandocPath, args);
+    try {
+      await runProcess(this.settings.pandocPath || DEFAULT_SETTINGS.pandocPath, args);
+    } catch (error) {
+      throw explainExportError(error, outputPath);
+    }
 
     if (this.settings.normalizeWithWord) {
       new Notice("Normalizing DOCX typography...");
@@ -71,9 +77,9 @@ module.exports = class MarkdownDocxExporterPlugin extends Plugin {
     }
 
     await this.app.vault.adapter.exists(outputFolderVaultPath);
-    await this.app.vault.adapter.exists(normalizePath(`${outputFolderVaultPath}/${outputFileName}`));
+    await this.app.vault.adapter.exists(normalizePath(`${outputFolderVaultPath}/${actualOutputFileName}`));
 
-    new Notice(`DOCX exported: ${outputFileName}`);
+    new Notice(`DOCX exported: ${actualOutputFileName}`);
 
     if (this.settings.openAfterExport) {
       await openPath(outputPath);
@@ -224,6 +230,49 @@ function runProcess(command, args) {
       resolve({ stdout, stderr });
     });
   });
+}
+
+async function resolveWritableOutputPath(preferredPath) {
+  if (!(await pathExists(preferredPath))) return preferredPath;
+  if (await canWriteExistingFile(preferredPath)) return preferredPath;
+
+  const parsed = path.parse(preferredPath);
+  for (let index = 2; index <= 99; index += 1) {
+    const candidate = path.join(parsed.dir, `${parsed.name} (${index})${parsed.ext}`);
+    if (!(await pathExists(candidate))) return candidate;
+    if (await canWriteExistingFile(candidate)) return candidate;
+  }
+
+  throw new Error("Cannot find a writable DOCX output file name.");
+}
+
+async function pathExists(targetPath) {
+  try {
+    await fs.promises.access(targetPath, fs.constants.F_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function canWriteExistingFile(targetPath) {
+  let handle = null;
+  try {
+    handle = await fs.promises.open(targetPath, "r+");
+    return true;
+  } catch {
+    return false;
+  } finally {
+    if (handle) await handle.close().catch(() => {});
+  }
+}
+
+function explainExportError(error, outputPath) {
+  const message = String(error && error.message ? error.message : error);
+  if (/permission denied|access is denied|denied/i.test(message)) {
+    return new Error(`Не удалось записать DOCX: ${path.basename(outputPath)}. Закройте файл в Word или выберите другую папку экспорта.`);
+  }
+  return error;
 }
 
 async function normalizeDocxWithWord(docxPath) {

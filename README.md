@@ -22,6 +22,12 @@ Obsidian Markdown -> Pandoc -> Word DOCX
 
 - `Export active Markdown to DOCX` - экспортирует текущую Markdown-заметку в `.docx`.
 
+Если файл с таким именем уже открыт в Word и Windows не даёт его перезаписать, плагин создаёт новый файл с номером, например:
+
+```text
+Название документа (2).docx
+```
+
 ## Настройки
 
 - `Pandoc path` - путь к `pandoc.exe` или команда `pandoc`, если Pandoc доступен из PATH.
