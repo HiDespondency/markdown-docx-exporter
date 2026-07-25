@@ -373,6 +373,13 @@ try {
           $style.Font.Bold = $true
           $style.Font.Color = $black
         }
+        try {
+          if ($name -match '^(Обычный|Normal|Body Text|Основной текст|Заголовок|Heading|Title|Название|Subtitle|Подзаголовок)') {
+            foreach ($border in $style.ParagraphFormat.Borders) {
+              $border.LineStyle = 0
+            }
+          }
+        } catch {}
       } catch {}
     }
 
@@ -394,6 +401,9 @@ try {
           $paragraph.Range.Font.Bold = $true
         } else {
           $paragraph.Range.Font.Size = $BodyFontSize
+        }
+        foreach ($border in $paragraph.Borders) {
+          $border.LineStyle = 0
         }
       } catch {}
     }
