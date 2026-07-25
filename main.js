@@ -1,12 +1,14 @@
 const { App, Notice, Plugin, PluginSettingTab, Setting, TFile, normalizePath } = require("obsidian");
 const { execFile } = require("child_process");
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 
 const DEFAULT_SETTINGS = {
   pandocPath: "pandoc",
   outputFolder: "Экспорт DOCX",
   referenceDocx: "",
+  normalizeWithWord: true,
   openAfterExport: true
 };
 
@@ -61,6 +63,11 @@ module.exports = class MarkdownDocxExporterPlugin extends Plugin {
 
     new Notice("Exporting Markdown to DOCX...");
     await runProcess(this.settings.pandocPath || DEFAULT_SETTINGS.pandocPath, args);
+
+    if (this.settings.normalizeWithWord) {
+      new Notice("Normalizing DOCX typography...");
+      await normalizeDocxWithWord(outputPath);
+    }
 
     await this.app.vault.adapter.exists(outputFolderVaultPath);
     await this.app.vault.adapter.exists(normalizePath(`${outputFolderVaultPath}/${outputFileName}`));
@@ -153,6 +160,16 @@ class MarkdownDocxExporterSettingTab extends PluginSettingTab {
         }));
 
     new Setting(containerEl)
+      .setName("Normalize typography with Word")
+      .setDesc("After export, use Microsoft Word to set Times New Roman, 12 pt, black text, and 10 pt footnotes.")
+      .addToggle((toggle) => toggle
+        .setValue(this.plugin.settings.normalizeWithWord)
+        .onChange(async (value) => {
+          this.plugin.settings.normalizeWithWord = value;
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(containerEl)
       .setName("Open DOCX after export")
       .setDesc("Open the exported file with the default system application.")
       .addToggle((toggle) => toggle
@@ -183,6 +200,86 @@ function runProcess(command, args) {
       resolve({ stdout, stderr });
     });
   });
+}
+
+async function normalizeDocxWithWord(docxPath) {
+  if (process.platform !== "win32") {
+    throw new Error("Word normalization is available only on Windows.");
+  }
+
+  const scriptPath = path.join(os.tmpdir(), `markdown-docx-normalize-${Date.now()}.ps1`);
+  const script = `
+param([Parameter(Mandatory=$true)][string]$DocxPath)
+$ErrorActionPreference = 'Stop'
+$word = New-Object -ComObject Word.Application
+$word.Visible = $false
+$word.DisplayAlerts = 0
+try {
+  $doc = $word.Documents.Open($DocxPath)
+  try {
+    $black = 0
+    $mainFont = 'Times New Roman'
+    $doc.Content.Font.Name = $mainFont
+    $doc.Content.Font.Size = 12
+    $doc.Content.Font.Color = $black
+
+    foreach ($style in $doc.Styles) {
+      try {
+        if ($style.Font -ne $null) {
+          $style.Font.Name = $mainFont
+          $style.Font.Color = $black
+          $style.Font.Size = 12
+        }
+      } catch {}
+    }
+
+    foreach ($footnote in $doc.Footnotes) {
+      $footnote.Range.Font.Name = $mainFont
+      $footnote.Range.Font.Size = 10
+      $footnote.Range.Font.Color = $black
+    }
+
+    foreach ($endnote in $doc.Endnotes) {
+      $endnote.Range.Font.Name = $mainFont
+      $endnote.Range.Font.Size = 10
+      $endnote.Range.Font.Color = $black
+    }
+
+    try {
+      $doc.Styles.Item('Footnote Text').Font.Name = $mainFont
+      $doc.Styles.Item('Footnote Text').Font.Size = 10
+      $doc.Styles.Item('Footnote Text').Font.Color = $black
+    } catch {}
+
+    try {
+      $doc.Styles.Item('Текст сноски').Font.Name = $mainFont
+      $doc.Styles.Item('Текст сноски').Font.Size = 10
+      $doc.Styles.Item('Текст сноски').Font.Color = $black
+    } catch {}
+
+    $doc.Save()
+  } finally {
+    $doc.Close($false)
+  }
+} finally {
+  $word.Quit()
+}
+`;
+
+  await fs.promises.writeFile(scriptPath, script, "utf8");
+  try {
+    await runProcess("powershell.exe", [
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      scriptPath,
+      "-DocxPath",
+      docxPath
+    ]);
+  } finally {
+    fs.promises.unlink(scriptPath).catch(() => {});
+  }
 }
 
 async function openPath(targetPath) {
