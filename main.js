@@ -64,38 +64,47 @@ module.exports = class MarkdownDocxExporterPlugin extends Plugin {
     const preferredOutputPath = path.join(outputFolderPath, outputFileName);
     const outputPath = await resolveWritableOutputPath(preferredOutputPath);
     const actualOutputFileName = path.basename(outputPath);
-    const args = this.buildPandocArgs(sourcePath, outputPath, vaultBasePath, file);
+    const preparedSourcePath = await createPreparedMarkdownSource(sourcePath, file.basename);
+    const args = this.buildPandocArgs(preparedSourcePath, outputPath, vaultBasePath, file, path.dirname(sourcePath));
+    const progressNotice = createActivityNotice("Экспорт DOCX: подготовка");
 
-    new Notice("Exporting Markdown to DOCX...");
     try {
+      progressNotice.setStage("Экспорт DOCX: преобразование Markdown");
       await runProcess(this.settings.pandocPath || DEFAULT_SETTINGS.pandocPath, args);
+      if (this.settings.normalizeWithWord) {
+        progressNotice.setStage("Экспорт DOCX: нормализация Word");
+        await normalizeDocxWithWord(outputPath, {
+          bodyFontSize: readFontSize(this.settings.bodyFontSize, DEFAULT_SETTINGS.bodyFontSize),
+          footnoteFontSize: readFontSize(this.settings.footnoteFontSize, DEFAULT_SETTINGS.footnoteFontSize)
+        });
+      } else {
+        progressNotice.setStage("Экспорт DOCX: завершение");
+      }
+
+      await this.app.vault.adapter.exists(outputFolderVaultPath);
+      await this.app.vault.adapter.exists(normalizePath(`${outputFolderVaultPath}/${actualOutputFileName}`));
+
+      progressNotice.complete(`DOCX готов: ${actualOutputFileName}`);
+
+      if (this.settings.openAfterExport) {
+        await openPath(outputPath);
+      }
+
+      setTimeout(() => progressNotice.hide(), 3000);
     } catch (error) {
+      progressNotice.hide();
       throw explainExportError(error, outputPath);
-    }
-
-    if (this.settings.normalizeWithWord) {
-      new Notice("Normalizing DOCX typography...");
-      await normalizeDocxWithWord(outputPath, {
-        bodyFontSize: readFontSize(this.settings.bodyFontSize, DEFAULT_SETTINGS.bodyFontSize),
-        footnoteFontSize: readFontSize(this.settings.footnoteFontSize, DEFAULT_SETTINGS.footnoteFontSize)
-      });
-    }
-
-    await this.app.vault.adapter.exists(outputFolderVaultPath);
-    await this.app.vault.adapter.exists(normalizePath(`${outputFolderVaultPath}/${actualOutputFileName}`));
-
-    new Notice(`DOCX exported: ${actualOutputFileName}`);
-
-    if (this.settings.openAfterExport) {
-      await openPath(outputPath);
+    } finally {
+      fs.promises.unlink(preparedSourcePath).catch(() => {});
     }
   }
 
-  buildPandocArgs(sourcePath, outputPath, vaultBasePath, file) {
+  buildPandocArgs(sourcePath, outputPath, vaultBasePath, file, originalSourceDir) {
     const resourcePaths = [
       vaultBasePath,
+      originalSourceDir,
       path.dirname(sourcePath)
-    ];
+    ].filter(Boolean);
 
     const args = [
       sourcePath,
@@ -253,6 +262,32 @@ function readFontSize(value, fallback) {
   return parsed;
 }
 
+async function createPreparedMarkdownSource(sourcePath, basename) {
+  const originalMarkdown = await fs.promises.readFile(sourcePath, "utf8");
+  const preparedMarkdown = transformObsidianMarkdownForWord(originalMarkdown);
+  const safeBaseName = sanitizeBaseName(basename);
+  const tempPath = path.join(os.tmpdir(), `markdown-docx-export-${Date.now()}-${safeBaseName}.md`);
+  await fs.promises.writeFile(tempPath, preparedMarkdown, "utf8");
+  return tempPath;
+}
+
+function transformObsidianMarkdownForWord(markdown) {
+  return markdown
+    .replace(/!?\[\[([^\]\n]+)\]\]/g, (match, inner) => {
+      if (match.startsWith("![[")) return match;
+      const parts = inner.split("|");
+      if (parts.length > 1) return parts.slice(1).join("|").trim();
+      return cleanWikilinkTargetForWord(parts[0]);
+    });
+}
+
+function cleanWikilinkTargetForWord(target) {
+  const withoutHeading = String(target).split("#").pop() || target;
+  const withoutBlockMarker = withoutHeading.replace(/^\^/, "");
+  const withoutExtension = withoutBlockMarker.replace(/\.(md|pdf|docx?)$/i, "");
+  return withoutExtension.trim();
+}
+
 function runProcess(command, args) {
   return new Promise((resolve, reject) => {
     execFile(command, args, { windowsHide: true }, (error, stdout, stderr) => {
@@ -264,6 +299,47 @@ function runProcess(command, args) {
       resolve({ stdout, stderr });
     });
   });
+}
+
+function createActivityNotice(initialStage) {
+  const barWidth = 8;
+  let stage = initialStage;
+  let filled = 1;
+  const notice = new Notice(formatActivityMessage(stage, filled, barWidth), 0);
+  const timer = setInterval(() => {
+    filled = filled >= barWidth ? 1 : filled + 1;
+    setNoticeMessage(notice, formatActivityMessage(stage, filled, barWidth));
+  }, 500);
+
+  return {
+    setStage(nextStage) {
+      stage = nextStage;
+      filled = 1;
+      setNoticeMessage(notice, formatActivityMessage(stage, filled, barWidth));
+    },
+    complete(message) {
+      clearInterval(timer);
+      setNoticeMessage(notice, message);
+    },
+    hide() {
+      clearInterval(timer);
+      if (typeof notice.hide === "function") notice.hide();
+    }
+  };
+}
+
+function formatActivityMessage(stage, filled, width) {
+  const active = "|".repeat(filled);
+  const empty = " ".repeat(Math.max(width - filled, 0));
+  return `${stage} [${active}${empty}]`;
+}
+
+function setNoticeMessage(notice, message) {
+  if (typeof notice.setMessage === "function") {
+    notice.setMessage(message);
+  } else {
+    new Notice(message, 2500);
+  }
 }
 
 async function resolveWritableOutputPath(preferredPath) {
@@ -338,6 +414,11 @@ try {
   try {
     $black = 0
     $mainFont = 'Times New Roman'
+    $russianLanguageId = 1049
+
+    try {
+      $doc.Content.LanguageID = $russianLanguageId
+    } catch {}
 
     # First make the whole style table use a legal academic font and black color,
     # but do not force every style to body size: headings and footnotes need their own sizes.
@@ -346,6 +427,7 @@ try {
         if ($style.Font -ne $null) {
           $style.Font.Name = $mainFont
           $style.Font.Color = $black
+          $style.Font.LanguageID = $russianLanguageId
         }
       } catch {}
     }
@@ -383,13 +465,15 @@ try {
       } catch {}
     }
 
-    # Normalize main text paragraphs without touching the footnote story.
+    # Paragraph and footnote ranges often carry direct formatting after Pandoc.
+    # This loop is slower than style-only changes, but it preserves the required Word result.
     $mainStory = $doc.StoryRanges.Item(1)
     foreach ($paragraph in $mainStory.Paragraphs) {
       try {
         $styleName = [string]$paragraph.Range.Style.NameLocal
         $paragraph.Range.Font.Name = $mainFont
         $paragraph.Range.Font.Color = $black
+        $paragraph.Range.LanguageID = $russianLanguageId
         if ($styleName -match '^(Заголовок 1|Heading 1|Title|Название)') {
           $paragraph.Range.Font.Size = $Heading1FontSize
           $paragraph.Range.Font.Bold = $true
@@ -412,11 +496,13 @@ try {
       $footnote.Range.Font.Name = $mainFont
       $footnote.Range.Font.Size = $FootnoteFontSize
       $footnote.Range.Font.Color = $black
+      $footnote.Range.LanguageID = $russianLanguageId
       try {
         $footnote.Reference.Font.Name = $mainFont
         $footnote.Reference.Font.Size = $FootnoteFontSize
         $footnote.Reference.Font.Color = $black
         $footnote.Reference.Font.Superscript = $true
+        $footnote.Reference.LanguageID = $russianLanguageId
       } catch {}
     }
 
@@ -424,11 +510,13 @@ try {
       $endnote.Range.Font.Name = $mainFont
       $endnote.Range.Font.Size = $FootnoteFontSize
       $endnote.Range.Font.Color = $black
+      $endnote.Range.LanguageID = $russianLanguageId
       try {
         $endnote.Reference.Font.Name = $mainFont
         $endnote.Reference.Font.Size = $FootnoteFontSize
         $endnote.Reference.Font.Color = $black
         $endnote.Reference.Font.Superscript = $true
+        $endnote.Reference.LanguageID = $russianLanguageId
       } catch {}
     }
 
