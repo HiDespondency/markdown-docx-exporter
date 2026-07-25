@@ -9,6 +9,8 @@ const DEFAULT_SETTINGS = {
   outputFolder: "Экспорт DOCX",
   referenceDocx: "",
   useBuiltInReferenceDocx: true,
+  bodyFontSize: 12,
+  footnoteFontSize: 10,
   normalizeWithWord: false,
   openAfterExport: true
 };
@@ -70,6 +72,11 @@ module.exports = class MarkdownDocxExporterPlugin extends Plugin {
     } catch (error) {
       throw explainExportError(error, outputPath);
     }
+
+    await patchDocxStyles(outputPath, {
+      bodyFontSize: readFontSize(this.settings.bodyFontSize, DEFAULT_SETTINGS.bodyFontSize),
+      footnoteFontSize: readFontSize(this.settings.footnoteFontSize, DEFAULT_SETTINGS.footnoteFontSize)
+    });
 
     if (this.settings.normalizeWithWord) {
       new Notice("Normalizing DOCX typography...");
@@ -190,6 +197,28 @@ class MarkdownDocxExporterSettingTab extends PluginSettingTab {
         }));
 
     new Setting(containerEl)
+      .setName("Body font size")
+      .setDesc("Standard text size in points. Enter a number, for example 12.")
+      .addText((text) => text
+        .setPlaceholder("12")
+        .setValue(String(this.plugin.settings.bodyFontSize ?? DEFAULT_SETTINGS.bodyFontSize))
+        .onChange(async (value) => {
+          this.plugin.settings.bodyFontSize = readFontSize(value, DEFAULT_SETTINGS.bodyFontSize);
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(containerEl)
+      .setName("Footnote font size")
+      .setDesc("Footnote text size in points. Enter a number, for example 10.")
+      .addText((text) => text
+        .setPlaceholder("10")
+        .setValue(String(this.plugin.settings.footnoteFontSize ?? DEFAULT_SETTINGS.footnoteFontSize))
+        .onChange(async (value) => {
+          this.plugin.settings.footnoteFontSize = readFontSize(value, DEFAULT_SETTINGS.footnoteFontSize);
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(containerEl)
       .setName("Normalize typography with Word")
       .setDesc("Slow fallback. After export, use Microsoft Word to force Times New Roman, 12 pt, black text, and 10 pt footnotes.")
       .addToggle((toggle) => toggle
@@ -219,6 +248,13 @@ function sanitizeBaseName(value) {
     .slice(0, 160) || "export";
 }
 
+function readFontSize(value, fallback) {
+  const parsed = Number(String(value).replace(",", "."));
+  if (!Number.isFinite(parsed)) return fallback;
+  if (parsed < 6 || parsed > 72) return fallback;
+  return parsed;
+}
+
 function runProcess(command, args) {
   return new Promise((resolve, reject) => {
     execFile(command, args, { windowsHide: true }, (error, stdout, stderr) => {
@@ -230,6 +266,157 @@ function runProcess(command, args) {
       resolve({ stdout, stderr });
     });
   });
+}
+
+async function patchDocxStyles(docxPath, options) {
+  const bodyFontSize = readFontSize(options.bodyFontSize, DEFAULT_SETTINGS.bodyFontSize);
+  const footnoteFontSize = readFontSize(options.footnoteFontSize, DEFAULT_SETTINGS.footnoteFontSize);
+  const scriptPath = path.join(os.tmpdir(), `markdown-docx-style-patch-${Date.now()}.ps1`);
+  const script = `
+param(
+  [Parameter(Mandatory=$true)][string]$DocxPath,
+  [Parameter(Mandatory=$true)][double]$BodyFontSize,
+  [Parameter(Mandatory=$true)][double]$FootnoteFontSize
+)
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.IO.Compression
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$wNs = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+$bodyHalfPoints = [int]($BodyFontSize * 2)
+$footnoteHalfPoints = [int]($FootnoteFontSize * 2)
+
+function Read-ZipEntryText($zip, $name) {
+  $entry = $zip.GetEntry($name)
+  if ($null -eq $entry) { return $null }
+  $reader = [System.IO.StreamReader]::new($entry.Open(), [System.Text.Encoding]::UTF8)
+  try { return $reader.ReadToEnd() } finally { $reader.Dispose() }
+}
+
+function Write-ZipEntryText($zip, $name, $text) {
+  $old = $zip.GetEntry($name)
+  if ($null -ne $old) { $old.Delete() }
+  $entry = $zip.CreateEntry($name)
+  $writer = [System.IO.StreamWriter]::new($entry.Open(), [System.Text.UTF8Encoding]::new($false))
+  try { $writer.Write($text) } finally { $writer.Dispose() }
+}
+
+function Ensure-Child($doc, $node, $localName) {
+  foreach ($child in $node.ChildNodes) {
+    if ($child.LocalName -eq $localName -and $child.NamespaceURI -eq $wNs) { return $child }
+  }
+  $created = $doc.CreateElement('w', $localName, $wNs)
+  [void]$node.AppendChild($created)
+  return $created
+}
+
+function Ensure-RunProps($doc, $node, [bool]$prepend) {
+  foreach ($child in $node.ChildNodes) {
+    if ($child.LocalName -eq 'rPr' -and $child.NamespaceURI -eq $wNs) { return $child }
+  }
+  $created = $doc.CreateElement('w', 'rPr', $wNs)
+  if ($prepend -and $node.HasChildNodes) {
+    [void]$node.InsertBefore($created, $node.FirstChild)
+  } else {
+    [void]$node.AppendChild($created)
+  }
+  return $created
+}
+
+function Set-RunProps($doc, $rPr, [int]$halfPoints, [bool]$superscript) {
+  $rFonts = Ensure-Child $doc $rPr 'rFonts'
+  foreach ($attr in @('ascii', 'hAnsi', 'eastAsia', 'cs')) {
+    $rFonts.SetAttribute($attr, $wNs, 'Times New Roman')
+  }
+  $sz = Ensure-Child $doc $rPr 'sz'
+  $sz.SetAttribute('val', $wNs, [string]$halfPoints)
+  $szCs = Ensure-Child $doc $rPr 'szCs'
+  $szCs.SetAttribute('val', $wNs, [string]$halfPoints)
+  $color = Ensure-Child $doc $rPr 'color'
+  $color.SetAttribute('val', $wNs, '000000')
+  if ($superscript) {
+    $vertAlign = Ensure-Child $doc $rPr 'vertAlign'
+    $vertAlign.SetAttribute('val', $wNs, 'superscript')
+  }
+}
+
+function Patch-StylesXml($xmlText) {
+  if ([string]::IsNullOrWhiteSpace($xmlText)) { return $xmlText }
+  [xml]$doc = $xmlText
+  $ns = [System.Xml.XmlNamespaceManager]::new($doc.NameTable)
+  $ns.AddNamespace('w', $wNs)
+
+  foreach ($styleId in @('Normal', 'BodyText', 'BodyText2', 'BodyText3', 'BlockText', 'Quote')) {
+    $style = $doc.SelectSingleNode("//w:style[@w:styleId='$styleId']", $ns)
+    if ($null -ne $style) {
+      $rPr = Ensure-RunProps $doc $style $false
+      Set-RunProps $doc $rPr $bodyHalfPoints $false
+    }
+  }
+
+  foreach ($styleId in @('FootnoteText', 'EndnoteText')) {
+    $style = $doc.SelectSingleNode("//w:style[@w:styleId='$styleId']", $ns)
+    if ($null -ne $style) {
+      $rPr = Ensure-RunProps $doc $style $false
+      Set-RunProps $doc $rPr $footnoteHalfPoints $false
+    }
+  }
+
+  foreach ($styleId in @('FootnoteReference', 'EndnoteReference')) {
+    $style = $doc.SelectSingleNode("//w:style[@w:styleId='$styleId']", $ns)
+    if ($null -ne $style) {
+      $rPr = Ensure-RunProps $doc $style $false
+      Set-RunProps $doc $rPr $footnoteHalfPoints $true
+    }
+  }
+
+  return $doc.OuterXml
+}
+
+function Patch-ReferenceRunsXml($xmlText) {
+  if ([string]::IsNullOrWhiteSpace($xmlText)) { return $xmlText }
+  [xml]$doc = $xmlText
+  $ns = [System.Xml.XmlNamespaceManager]::new($doc.NameTable)
+  $ns.AddNamespace('w', $wNs)
+  $runs = $doc.SelectNodes('//w:r[w:footnoteReference or w:endnoteReference]', $ns)
+  foreach ($run in $runs) {
+    $rPr = Ensure-RunProps $doc $run $true
+    Set-RunProps $doc $rPr $footnoteHalfPoints $true
+  }
+  return $doc.OuterXml
+}
+
+$zip = [System.IO.Compression.ZipFile]::Open($DocxPath, [System.IO.Compression.ZipArchiveMode]::Update)
+try {
+  $styles = Read-ZipEntryText $zip 'word/styles.xml'
+  if ($null -ne $styles) { Write-ZipEntryText $zip 'word/styles.xml' (Patch-StylesXml $styles) }
+
+  foreach ($entryName in @('word/document.xml', 'word/footnotes.xml', 'word/endnotes.xml')) {
+    $xml = Read-ZipEntryText $zip $entryName
+    if ($null -ne $xml) { Write-ZipEntryText $zip $entryName (Patch-ReferenceRunsXml $xml) }
+  }
+} finally {
+  $zip.Dispose()
+}
+`;
+
+  await fs.promises.writeFile(scriptPath, script, "utf8");
+  try {
+    await runProcess("powershell.exe", [
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      scriptPath,
+      "-DocxPath",
+      docxPath,
+      "-BodyFontSize",
+      String(bodyFontSize),
+      "-FootnoteFontSize",
+      String(footnoteFontSize)
+    ]);
+  } finally {
+    fs.promises.unlink(scriptPath).catch(() => {});
+  }
 }
 
 async function resolveWritableOutputPath(preferredPath) {
