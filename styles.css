@@ -1,0 +1,5 @@
+.markdown-docx-exporter-setting-warning {
+  color: var(--text-warning);
+  font-size: var(--font-ui-small);
+  line-height: 1.4;
+}

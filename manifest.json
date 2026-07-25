@@ -1,0 +1,10 @@
+{
+  "id": "markdown-docx-exporter",
+  "name": "Markdown DOCX Exporter",
+  "version": "0.1.0",
+  "minAppVersion": "1.5.0",
+  "description": "Exports the active Markdown note to DOCX through Pandoc and an optional Word reference template.",
+  "author": "OpenAI Codex",
+  "authorUrl": "https://openai.com",
+  "isDesktopOnly": true
+}
