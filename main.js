@@ -11,7 +11,7 @@ const DEFAULT_SETTINGS = {
   useBuiltInReferenceDocx: true,
   bodyFontSize: 12,
   footnoteFontSize: 10,
-  normalizeWithWord: false,
+  normalizeWithWord: true,
   openAfterExport: true
 };
 
@@ -218,7 +218,7 @@ class MarkdownDocxExporterSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Normalize typography with Word")
-      .setDesc("Slow but safest fallback. After export, use Microsoft Word to apply the selected font sizes and footnote styling.")
+      .setDesc("Recommended. After export, use Microsoft Word to apply Times New Roman, headings, selected font sizes, and correct footnote styling.")
       .addToggle((toggle) => toggle
         .setValue(this.plugin.settings.normalizeWithWord)
         .onChange(async (value) => {
@@ -316,12 +316,18 @@ async function normalizeDocxWithWord(docxPath, options = {}) {
 
   const bodyFontSize = readFontSize(options.bodyFontSize, DEFAULT_SETTINGS.bodyFontSize);
   const footnoteFontSize = readFontSize(options.footnoteFontSize, DEFAULT_SETTINGS.footnoteFontSize);
+  const heading1FontSize = Math.max(bodyFontSize + 4, 16);
+  const heading2FontSize = Math.max(bodyFontSize + 2, 14);
+  const heading3FontSize = Math.max(bodyFontSize, 12);
   const scriptPath = path.join(os.tmpdir(), `markdown-docx-normalize-${Date.now()}.ps1`);
   const script = `
 param(
   [Parameter(Mandatory=$true)][string]$DocxPath,
   [Parameter(Mandatory=$true)][double]$BodyFontSize,
-  [Parameter(Mandatory=$true)][double]$FootnoteFontSize
+  [Parameter(Mandatory=$true)][double]$FootnoteFontSize,
+  [Parameter(Mandatory=$true)][double]$Heading1FontSize,
+  [Parameter(Mandatory=$true)][double]$Heading2FontSize,
+  [Parameter(Mandatory=$true)][double]$Heading3FontSize
 )
 $ErrorActionPreference = 'Stop'
 $word = New-Object -ComObject Word.Application
@@ -332,16 +338,62 @@ try {
   try {
     $black = 0
     $mainFont = 'Times New Roman'
-    $doc.Content.Font.Name = $mainFont
-    $doc.Content.Font.Size = $BodyFontSize
-    $doc.Content.Font.Color = $black
 
+    # First make the whole style table use a legal academic font and black color,
+    # but do not force every style to body size: headings and footnotes need their own sizes.
     foreach ($style in $doc.Styles) {
       try {
         if ($style.Font -ne $null) {
           $style.Font.Name = $mainFont
           $style.Font.Color = $black
+        }
+      } catch {}
+    }
+
+    foreach ($style in $doc.Styles) {
+      try {
+        $name = [string]$style.NameLocal
+        if ($name -match '^(Обычный|Normal|Body Text|Основной текст)') {
+          $style.Font.Name = $mainFont
           $style.Font.Size = $BodyFontSize
+          $style.Font.Color = $black
+        } elseif ($name -match '^(Заголовок 1|Heading 1|Title|Название)') {
+          $style.Font.Name = $mainFont
+          $style.Font.Size = $Heading1FontSize
+          $style.Font.Bold = $true
+          $style.Font.Color = $black
+        } elseif ($name -match '^(Заголовок 2|Heading 2|Subtitle|Подзаголовок)') {
+          $style.Font.Name = $mainFont
+          $style.Font.Size = $Heading2FontSize
+          $style.Font.Bold = $true
+          $style.Font.Color = $black
+        } elseif ($name -match '^(Заголовок 3|Heading 3)') {
+          $style.Font.Name = $mainFont
+          $style.Font.Size = $Heading3FontSize
+          $style.Font.Bold = $true
+          $style.Font.Color = $black
+        }
+      } catch {}
+    }
+
+    # Normalize main text paragraphs without touching the footnote story.
+    $mainStory = $doc.StoryRanges.Item(1)
+    foreach ($paragraph in $mainStory.Paragraphs) {
+      try {
+        $styleName = [string]$paragraph.Range.Style.NameLocal
+        $paragraph.Range.Font.Name = $mainFont
+        $paragraph.Range.Font.Color = $black
+        if ($styleName -match '^(Заголовок 1|Heading 1|Title|Название)') {
+          $paragraph.Range.Font.Size = $Heading1FontSize
+          $paragraph.Range.Font.Bold = $true
+        } elseif ($styleName -match '^(Заголовок 2|Heading 2|Subtitle|Подзаголовок)') {
+          $paragraph.Range.Font.Size = $Heading2FontSize
+          $paragraph.Range.Font.Bold = $true
+        } elseif ($styleName -match '^(Заголовок 3|Heading 3)') {
+          $paragraph.Range.Font.Size = $Heading3FontSize
+          $paragraph.Range.Font.Bold = $true
+        } else {
+          $paragraph.Range.Font.Size = $BodyFontSize
         }
       } catch {}
     }
@@ -350,12 +402,24 @@ try {
       $footnote.Range.Font.Name = $mainFont
       $footnote.Range.Font.Size = $FootnoteFontSize
       $footnote.Range.Font.Color = $black
+      try {
+        $footnote.Reference.Font.Name = $mainFont
+        $footnote.Reference.Font.Size = $FootnoteFontSize
+        $footnote.Reference.Font.Color = $black
+        $footnote.Reference.Font.Superscript = $true
+      } catch {}
     }
 
     foreach ($endnote in $doc.Endnotes) {
       $endnote.Range.Font.Name = $mainFont
       $endnote.Range.Font.Size = $FootnoteFontSize
       $endnote.Range.Font.Color = $black
+      try {
+        $endnote.Reference.Font.Name = $mainFont
+        $endnote.Reference.Font.Size = $FootnoteFontSize
+        $endnote.Reference.Font.Color = $black
+        $endnote.Reference.Font.Superscript = $true
+      } catch {}
     }
 
     try {
@@ -400,7 +464,13 @@ try {
       "-BodyFontSize",
       String(bodyFontSize),
       "-FootnoteFontSize",
-      String(footnoteFontSize)
+      String(footnoteFontSize),
+      "-Heading1FontSize",
+      String(heading1FontSize),
+      "-Heading2FontSize",
+      String(heading2FontSize),
+      "-Heading3FontSize",
+      String(heading3FontSize)
     ]);
   } finally {
     fs.promises.unlink(scriptPath).catch(() => {});
