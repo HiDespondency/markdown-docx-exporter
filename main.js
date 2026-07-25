@@ -8,7 +8,8 @@ const DEFAULT_SETTINGS = {
   pandocPath: "pandoc",
   outputFolder: "Экспорт DOCX",
   referenceDocx: "",
-  normalizeWithWord: true,
+  useBuiltInReferenceDocx: true,
+  normalizeWithWord: false,
   openAfterExport: true
 };
 
@@ -97,6 +98,11 @@ module.exports = class MarkdownDocxExporterPlugin extends Plugin {
       resourcePaths.join(path.delimiter)
     ];
 
+    const underlineFilter = path.join(vaultBasePath, ".obsidian", "plugins", this.manifest.id, "underline.lua");
+    if (fs.existsSync(underlineFilter)) {
+      args.push("--lua-filter", underlineFilter);
+    }
+
     const referenceDocx = (this.settings.referenceDocx || "").trim();
     if (referenceDocx) {
       const resolvedReference = path.isAbsolute(referenceDocx)
@@ -106,6 +112,14 @@ module.exports = class MarkdownDocxExporterPlugin extends Plugin {
         throw new Error(`Reference DOCX not found: ${resolvedReference}`);
       }
       args.push("--reference-doc", resolvedReference);
+    } else if (this.settings.useBuiltInReferenceDocx) {
+      const builtInReference = path.join(".obsidian", "plugins", this.manifest.id, "reference.docx");
+      const resolvedReference = path.isAbsolute(builtInReference)
+        ? builtInReference
+        : path.join(vaultBasePath, builtInReference);
+      if (fs.existsSync(resolvedReference)) {
+        args.push("--reference-doc", resolvedReference);
+      }
     }
 
     return args;
@@ -150,7 +164,7 @@ class MarkdownDocxExporterSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Reference DOCX")
-      .setDesc("Optional Word reference template. Use a vault-relative or absolute path.")
+      .setDesc("Optional Word reference template. If empty, the built-in plain academic template is used.")
       .addText((text) => text
         .setPlaceholder("Templates/dissertation-reference.docx")
         .setValue(this.plugin.settings.referenceDocx)
@@ -160,8 +174,18 @@ class MarkdownDocxExporterSettingTab extends PluginSettingTab {
         }));
 
     new Setting(containerEl)
+      .setName("Use built-in plain DOCX template")
+      .setDesc("Use Times New Roman, 12 pt body text, black font, and 10 pt footnotes without opening Word after export.")
+      .addToggle((toggle) => toggle
+        .setValue(this.plugin.settings.useBuiltInReferenceDocx)
+        .onChange(async (value) => {
+          this.plugin.settings.useBuiltInReferenceDocx = value;
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(containerEl)
       .setName("Normalize typography with Word")
-      .setDesc("After export, use Microsoft Word to set Times New Roman, 12 pt, black text, and 10 pt footnotes.")
+      .setDesc("Slow fallback. After export, use Microsoft Word to force Times New Roman, 12 pt, black text, and 10 pt footnotes.")
       .addToggle((toggle) => toggle
         .setValue(this.plugin.settings.normalizeWithWord)
         .onChange(async (value) => {
