@@ -7,12 +7,14 @@ const path = require("path");
 const DEFAULT_SETTINGS = {
   pandocPath: "pandoc",
   outputFolder: "Экспорт DOCX",
+  importFolder: "Импорт DOCX",
   referenceDocx: "",
   useBuiltInReferenceDocx: true,
   bodyFontSize: 12,
   footnoteFontSize: 10,
   normalizeWithWord: true,
-  openAfterExport: true
+  openAfterExport: true,
+  openMarkdownAfterImport: true
 };
 
 module.exports = class MarkdownDocxExporterPlugin extends Plugin {
@@ -29,6 +31,21 @@ module.exports = class MarkdownDocxExporterPlugin extends Plugin {
         this.exportActiveMarkdown().catch((error) => {
           console.error("[markdown-docx-exporter] Export failed", error);
           new Notice(`DOCX export failed: ${error.message || error}`);
+        });
+        return true;
+      }
+    });
+
+    this.addCommand({
+      id: "import-active-docx-to-markdown",
+      name: "Import active DOCX to Markdown",
+      checkCallback: (checking) => {
+        const file = this.app.workspace.getActiveFile();
+        const canRun = file instanceof TFile && file.extension === "docx";
+        if (checking) return canRun;
+        this.importActiveDocx().catch((error) => {
+          console.error("[markdown-docx-exporter] Import failed", error);
+          new Notice(`DOCX import failed: ${error.message || error}`);
         });
         return true;
       }
@@ -144,6 +161,59 @@ module.exports = class MarkdownDocxExporterPlugin extends Plugin {
 
     return args;
   }
+
+  async importActiveDocx() {
+    const file = this.app.workspace.getActiveFile();
+    if (!(file instanceof TFile) || file.extension !== "docx") {
+      throw new Error("Active file is not a DOCX file.");
+    }
+
+    const vaultBasePath = this.getVaultBasePath();
+    const sourcePath = path.join(vaultBasePath, file.path);
+    const importFolderVaultPath = normalizePath(this.settings.importFolder || DEFAULT_SETTINGS.importFolder);
+    const importFolderPath = path.join(vaultBasePath, importFolderVaultPath);
+    await fs.promises.mkdir(importFolderPath, { recursive: true });
+
+    const outputFileName = `${sanitizeBaseName(file.basename)}.md`;
+    const preferredOutputPath = path.join(importFolderPath, outputFileName);
+    const outputPath = await resolveWritableOutputPath(preferredOutputPath);
+    const actualOutputFileName = path.basename(outputPath);
+    const mediaFolderPath = path.join(importFolderPath, `${path.parse(actualOutputFileName).name}-media`);
+    const progressNotice = createActivityNotice("Импорт DOCX: подготовка");
+
+    try {
+      progressNotice.setStage("Импорт DOCX: преобразование Word");
+      await runProcess(this.settings.pandocPath || DEFAULT_SETTINGS.pandocPath, [
+        sourcePath,
+        "--from",
+        "docx",
+        "--to",
+        "gfm+footnotes+smart",
+        "--wrap",
+        "none",
+        "--extract-media",
+        mediaFolderPath,
+        "--output",
+        outputPath
+      ]);
+
+      progressNotice.setStage("Импорт DOCX: очистка таблиц");
+      await normalizeImportedMarkdown(outputPath);
+
+      const outputVaultPath = normalizePath(`${importFolderVaultPath}/${actualOutputFileName}`);
+      await this.app.vault.adapter.exists(outputVaultPath);
+      progressNotice.complete(`Markdown готов: ${actualOutputFileName}`);
+
+      if (this.settings.openMarkdownAfterImport) {
+        await this.app.workspace.openLinkText(outputVaultPath, "", false);
+      }
+
+      setTimeout(() => progressNotice.hide(), 3000);
+    } catch (error) {
+      progressNotice.hide();
+      throw error;
+    }
+  }
 };
 
 class MarkdownDocxExporterSettingTab extends PluginSettingTab {
@@ -179,6 +249,17 @@ class MarkdownDocxExporterSettingTab extends PluginSettingTab {
         .setValue(this.plugin.settings.outputFolder)
         .onChange(async (value) => {
           this.plugin.settings.outputFolder = normalizePath(value.trim() || DEFAULT_SETTINGS.outputFolder);
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(containerEl)
+      .setName("DOCX import folder")
+      .setDesc("Vault-relative folder where imported Markdown files will be written.")
+      .addText((text) => text
+        .setPlaceholder("Импорт DOCX")
+        .setValue(this.plugin.settings.importFolder)
+        .onChange(async (value) => {
+          this.plugin.settings.importFolder = normalizePath(value.trim() || DEFAULT_SETTINGS.importFolder);
           await this.plugin.saveSettings();
         }));
 
@@ -244,6 +325,16 @@ class MarkdownDocxExporterSettingTab extends PluginSettingTab {
           this.plugin.settings.openAfterExport = value;
           await this.plugin.saveSettings();
         }));
+
+    new Setting(containerEl)
+      .setName("Open Markdown after DOCX import")
+      .setDesc("Open the imported Markdown note after converting a DOCX file.")
+      .addToggle((toggle) => toggle
+        .setValue(this.plugin.settings.openMarkdownAfterImport)
+        .onChange(async (value) => {
+          this.plugin.settings.openMarkdownAfterImport = value;
+          await this.plugin.saveSettings();
+        }));
   }
 }
 
@@ -286,6 +377,85 @@ function cleanWikilinkTargetForWord(target) {
   const withoutBlockMarker = withoutHeading.replace(/^\^/, "");
   const withoutExtension = withoutBlockMarker.replace(/\.(md|pdf|docx?)$/i, "");
   return withoutExtension.trim();
+}
+
+async function normalizeImportedMarkdown(markdownPath) {
+  const markdown = await fs.promises.readFile(markdownPath, "utf8");
+  const normalized = convertHtmlTablesToMarkdown(markdown);
+  if (normalized !== markdown) {
+    await fs.promises.writeFile(markdownPath, normalized, "utf8");
+  }
+}
+
+function convertHtmlTablesToMarkdown(markdown) {
+  if (!markdown.includes("<table")) return markdown;
+  return markdown.replace(/<table[\s\S]*?<\/table>/gi, (tableHtml) => {
+    const tableMarkdown = htmlTableToPipeMarkdown(tableHtml);
+    return tableMarkdown || tableHtml;
+  });
+}
+
+function htmlTableToPipeMarkdown(tableHtml) {
+  if (typeof DOMParser === "undefined") return null;
+
+  const doc = new DOMParser().parseFromString(tableHtml, "text/html");
+  const table = doc.querySelector("table");
+  if (!table) return null;
+
+  const headerRow = table.querySelector("thead tr") || table.querySelector("tr");
+  if (!headerRow) return null;
+
+  const headers = Array.from(headerRow.cells)
+    .map((cell) => normalizeTableCellText(cell))
+    .filter((value) => value.length > 0);
+  if (headers.length === 0) return null;
+
+  const bodyRows = Array.from(table.querySelectorAll("tbody tr"));
+  const rows = (bodyRows.length > 0 ? bodyRows : Array.from(table.querySelectorAll("tr")).slice(1))
+    .map((row) => normalizeTableRow(row, headers.length))
+    .filter((row) => row.some((cell) => cell.length > 0));
+
+  if (rows.length === 0) return null;
+
+  const lines = [
+    `| ${headers.map(escapeMarkdownTableCell).join(" | ")} |`,
+    `| ${headers.map(() => "---").join(" | ")} |`,
+    ...rows.map((row) => `| ${row.map(escapeMarkdownTableCell).join(" | ")} |`)
+  ];
+
+  return `\n${lines.join("\n")}\n`;
+}
+
+function normalizeTableRow(row, columnCount) {
+  const cells = Array.from(row.cells).map((cell) => normalizeTableCellText(cell));
+  if (cells.length > columnCount) {
+    const leadingCellCount = cells.length - columnCount + 1;
+    const leading = cells
+      .slice(0, leadingCellCount)
+      .map((cell) => cell.trim())
+      .filter(Boolean)
+      .join(" / ");
+    return [leading, ...cells.slice(leadingCellCount)].slice(0, columnCount);
+  }
+  while (cells.length < columnCount) cells.push("");
+  return cells.slice(0, columnCount);
+}
+
+function normalizeTableCellText(cell) {
+  const clone = cell.cloneNode(true);
+  clone.querySelectorAll("br").forEach((br) => br.replaceWith(" "));
+  return (clone.textContent || "")
+    .replace(/\s+/g, " ")
+    .replace(/\*\*\*/g, "")
+    .replace(/\*\*/g, "")
+    .trim();
+}
+
+function escapeMarkdownTableCell(value) {
+  return String(value)
+    .replace(/\\/g, "\\\\")
+    .replace(/\|/g, "\\|")
+    .replace(/\r?\n/g, "<br>");
 }
 
 function runProcess(command, args) {

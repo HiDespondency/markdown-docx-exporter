@@ -3,7 +3,7 @@
   "name": "Markdown DOCX Exporter",
   "version": "0.1.0",
   "minAppVersion": "1.5.0",
-  "description": "Exports the active Markdown note to DOCX through Pandoc and an optional Word reference template.",
+  "description": "Converts Markdown to DOCX and DOCX back to Markdown through Pandoc.",
   "author": "OpenAI Codex",
   "authorUrl": "https://openai.com",
   "isDesktopOnly": true
